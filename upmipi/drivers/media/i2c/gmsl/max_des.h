@@ -8,6 +8,8 @@
 
 #include <media/v4l2-mediabus.h>
 
+#include "caminfo.h"
+
 #define MAX_DES_DT_VC(dt, vc) (((vc) & 0x3) << 6 | ((dt) & 0x3f))
 
 struct max_des_remap {
@@ -21,6 +23,20 @@ struct max_des_remap {
 struct max_des_link {
 	unsigned int index;
 	bool enabled;
+
+	/* Camera profile detected on this physical GMSL link. */
+	const struct cam_profile *cam;
+
+	/* Early scan diagnostics. */
+	enum cam_gmsl2_rx_rate detected_rate;
+	u8 serializer_addr_7bit;
+	u8 serializer_dev_id;
+	u8 serializer_dev_rev;
+	u8 eeprom_addr_7bit;
+	bool serializer_present;
+	bool serializer_dev_id_valid;
+	bool serializer_dev_rev_valid;
+	bool eeprom_present;
 };
 
 struct max_des_pipe_mode {
@@ -112,6 +128,13 @@ struct max_des_ops {
 	int (*set_pipe_tunnel_enable)(struct max_des *des, struct max_des_pipe *pipe,
 				      bool enable);
 	int (*select_links)(struct max_des *des, unsigned int mask);
+	/*
+	 * Configure one physical GMSL link receive rate.
+	 * The chip-specific implementation is responsible for packing the
+	 * corresponding MAX96724 0x0010/0x0011 field and resetting that link.
+	 */
+	int (*set_link_rate)(struct max_des *des, unsigned int link_id,
+			     enum cam_gmsl2_rx_rate rate);
 };
 
 struct max_des_priv;

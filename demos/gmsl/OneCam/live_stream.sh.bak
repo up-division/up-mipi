@@ -1,12 +1,25 @@
 if [ $# -lt 3 ]; then
-    echo "usage: ./live_stream.sh [Port] [ISYS Capture Channel] [Sensor Type] [Software ISP] [Resolution]"
-    echo "Software ISP: off | profile (default: off)"
+    echo "usage: ./live_stream.sh [DeviceName] [Port] [ISYS Capture Channel] [Resolution] [Format]"
     echo -e "Example:"
-
-    echo -e "./live_stream.sh 4 32 "ar0820c" profile        SW ISP:  on, default resolution"   
-    echo -e "./live_stream.sh 4 33 "ar0820c" off            SW ISP: off, default resolution"
-    echo -e "./live_stream.sh 4 34 "ar0820c"                SW ISP: off, default resolution"
-    echo -e "./live_stream.sh 4 35 "isx031" "
+    echo -e "./live_stream.sh 0 0"
+    echo -e "./live_stream.sh 0 1"
+    echo -e "./live_stream.sh 0 2"
+    echo -e "./live_stream.sh 0 3"
+    echo -e ""
+    echo -e "./live_stream.sh 1 8 "
+    echo -e "./live_stream.sh 1 9 "
+    echo -e "./live_stream.sh 1 10"
+    echo -e "./live_stream.sh 1 11"
+    echo -e ""
+    echo -e "./live_stream.sh 2 16"
+    echo -e "./live_stream.sh 2 17"
+    echo -e "./live_stream.sh 2 18"
+    echo -e "./live_stream.sh 2 19"
+    echo -e ""
+    echo -e "./live_stream.sh 4 32"
+    echo -e "./live_stream.sh 4 33"
+    echo -e "./live_stream.sh 4 34"
+    echo -e "./live_stream.sh 4 35"
     exit 1
 fi
 
@@ -22,17 +35,8 @@ fi
 PORT=$1
 ISYS=$2
 SENSOR_TYPE=$3
-SOFTWARE_ISP=${4-off}
-RESOLUTION=${5-1920x1536}
+RESOLUTION=${4-1920x1536}
 FMT=UYVY8_1X16
-
-case "$SOFTWARE_ISP" in
-    off|profile) ;;
-    *)
-        echo "Error: Software ISP 必須是 off 或 profile，目前輸入：$SOFTWARE_ISP"
-        exit 1
-        ;;
-esac
 
 
 
@@ -174,13 +178,12 @@ echo "flag"
 
 echo "========== Stream Config =========="
 echo "Dev: $SENSOR_TYPE | Res: $WIDTH x $HEIGHT | Mode: Live Only"
-echo "Software ISP: $SOFTWARE_ISP"
 
 # ==========================================
 # 執行即時串流：V4L2 -> Python
 # ==========================================
 CMD_V4L2="v4l2-ctl -d $CAPTURE_DEV --set-fmt-video=width=$WIDTH,height=$HEIGHT,pixelformat=$V4L2_FMT --stream-mmap --stream-count=0 --stream-to=-"
-CMD_PYTHON="python3 camera_app.py --sensor $SENSOR_TYPE --width $WIDTH --height $HEIGHT --software-isp $SOFTWARE_ISP"
+CMD_PYTHON="python3 camera_app.py --sensor $SENSOR_TYPE --width $WIDTH --height $HEIGHT"
 
 $CMD_V4L2 | $CMD_PYTHON
 

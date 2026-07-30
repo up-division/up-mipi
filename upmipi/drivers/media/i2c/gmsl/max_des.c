@@ -101,6 +101,33 @@ static int max_des_remote_write16(struct i2c_adapter *adap, u8 addr_7bit, u16 re
 	return (i2c_transfer(adap, &msg, 1) == 1) ? 0 : -EIO;
 }
 
+static int max_des_remote_read16(struct i2c_adapter *adap, u8 addr_7bit,
+				 u16 reg, u8 *val)
+{
+	u8 reg_buf[2] = { reg >> 8, reg & 0xff };
+	struct i2c_msg msgs[2] = {
+		{
+			.addr = addr_7bit,
+			.flags = 0,
+			.len = sizeof(reg_buf),
+			.buf = reg_buf,
+		},
+		{
+			.addr = addr_7bit,
+			.flags = I2C_M_RD,
+			.len = 1,
+			.buf = val,
+		},
+	};
+	int ret;
+
+	if (!val)
+		return -EINVAL;
+
+	ret = i2c_transfer(adap, msgs, ARRAY_SIZE(msgs));
+	return ret == ARRAY_SIZE(msgs) ? 0 : (ret < 0 ? ret : -EIO);
+}
+
 static inline u8 max_des_ser_new_addr_8bit(unsigned int link_id)
 {
 	/* vendor script:
@@ -123,6 +150,331 @@ static bool max_des_i2c_addr_present(struct i2c_adapter *adap, u8 addr_7bit)
 	ret = i2c_transfer(adap, msgs, 1);
 	return ret == 1;
 }
+
+static void max_des_clear_link_scan_result(struct max_des_link *link)
+{
+	unsigned int index;
+
+	if (!link)
+		return;
+
+	index = link->index;
+	memset(link, 0, sizeof(*link));
+	link->index = index;
+}
+
+static int max_des_set_all_link_rates(struct max_des_priv *priv,
+				      enum cam_gmsl2_rx_rate rate)
+{
+	struct max_des *des = priv->des;
+	unsigned int link;
+	int ret;
+
+	if (!des->ops->set_link_rate)
+		return -EOPNOTSUPP;
+
+	for (link = 0; link < des->ops->num_links; link++) {
+		ret = des->ops->set_link_rate(des, link, rate);
+		if (ret) {
+			dev_err(priv->dev,
+				"[DES-SCAN] failed to set link%u rate=%u: %d\n",
+				link, rate, ret);
+			return ret;
+		}
+	}
+
+	/*
+	 * After four per-link updates the MAX96724 registers are equivalent to:
+	 *   rate 3G: 0x0010 = 0x11, 0x0011 = 0x11
+	 *   rate 6G: 0x0010 = 0x22, 0x0011 = 0x22
+	 */
+	msleep(MAX_DES_LINK_SETTLE_MS);
+	return 0;
+}
+
+static int max_des_read_serializer_identity(struct max_des_priv *priv,
+					     unsigned int link_id,
+					     u8 *ser_addr,
+					     u8 *dev_id,
+					     bool *dev_id_valid,
+					     u8 *dev_rev,
+					     bool *dev_rev_valid)
+{
+	struct i2c_adapter *adap = priv->client->adapter;
+	u8 final_addr = 0x41 + link_id;
+	u8 candidates[2] = { final_addr, 0x40 };
+	unsigned int i;
+	int ret;
+
+	*ser_addr = 0;
+	*dev_id = 0;
+	*dev_rev = 0;
+	*dev_id_valid = false;
+	*dev_rev_valid = false;
+
+	for (i = 0; i < ARRAY_SIZE(candidates); i++) {
+		u8 id;
+		u8 rev;
+
+		ret = max_des_remote_read16(adap, candidates[i], 0x000d, &id);
+		if (ret)
+			continue;
+
+		*ser_addr = candidates[i];
+		*dev_id = id;
+		*dev_id_valid = true;
+
+		ret = max_des_remote_read16(adap, candidates[i], 0x000e, &rev);
+		if (!ret) {
+			*dev_rev = rev;
+			*dev_rev_valid = true;
+		}
+
+		dev_info(priv->dev,
+			 "[DES-SCAN] link%u serializer found at 0x%02x DEV_ID=0x%02x DEV_REV=%s0x%02x\n",
+			 link_id, candidates[i], id,
+			 *dev_rev_valid ? "" : "unreadable/",
+			 *dev_rev_valid ? rev : 0);
+
+		return 0;
+	}
+
+	dev_info(priv->dev,
+		 "[DES-SCAN] link%u no readable serializer DEV_ID at 0x40/0x%02x\n",
+		 link_id, final_addr);
+
+	return -ENODEV;
+}
+
+static int max_des_scan_one_link(struct max_des_priv *priv,
+				 unsigned int link_id,
+				 enum cam_gmsl2_rx_rate rate)
+{
+	struct max_des *des = priv->des;
+	struct max_des_link *link = &des->links[link_id];
+	const struct cam_profile *profile;
+	u8 ser_addr = 0;
+	u8 dev_id = 0;
+	u8 dev_rev = 0;
+	bool dev_id_valid = false;
+	bool dev_rev_valid = false;
+	bool eeprom_0x50;
+	bool eeprom_0x51;
+	int ret;
+
+	ret = des->ops->select_links(des, BIT(link_id));
+	if (ret)
+		return ret;
+
+	msleep(MAX_DES_LINK_SETTLE_MS);
+
+	/*
+	 * Probe both serializer address states:
+	 *   default address: 0x40
+	 *   re-addressed link0..3: 0x41..0x44
+	 */
+	max_des_read_serializer_identity(priv, link_id,
+					 &ser_addr,
+					 &dev_id, &dev_id_valid,
+					 &dev_rev, &dev_rev_valid);
+
+	/*
+	 * Module EEPROM signature:
+	 *   ISX031 module: 0x50
+	 *   AR0820C module: 0x51
+	 *
+	 * Only one physical link is selected, so identical EEPROM addresses on
+	 * different links do not collide during this scan.
+	 */
+	eeprom_0x50 = max_des_i2c_addr_present(priv->client->adapter, 0x50);
+	eeprom_0x51 = max_des_i2c_addr_present(priv->client->adapter, 0x51);
+
+	dev_info(priv->dev,
+		 "[DES-SCAN] link%u rate=%uG signatures: ser=%s addr=0x%02x id=%s0x%02x rev=%s0x%02x eeprom50=%u eeprom51=%u\n",
+		 link_id,
+		 rate == CAM_GMSL2_RX_RATE_6GBPS ? 6 : 3,
+		 dev_id_valid ? "yes" : "no",
+		 ser_addr,
+		 dev_id_valid ? "" : "invalid/",
+		 dev_id,
+		 dev_rev_valid ? "" : "invalid/",
+		 dev_rev,
+		 eeprom_0x50,
+		 eeprom_0x51);
+
+	profile = cam_profile_match_scan(rate,
+					 dev_id_valid,
+					 dev_id,
+					 eeprom_0x50,
+					 eeprom_0x51);
+	if (!profile)
+		return -ENODEV;
+
+	if (link->cam && link->cam != profile) {
+		dev_warn(priv->dev,
+			 "[DES-SCAN] link%u already matched %s, ignore conflicting %s\n",
+			 link_id, link->cam->profile_name, profile->profile_name);
+		return -EEXIST;
+	}
+
+	link->enabled = true;
+	link->cam = profile;
+	link->detected_rate = rate;
+	link->serializer_addr_7bit = ser_addr;
+	link->serializer_present = dev_id_valid;
+	link->serializer_dev_id_valid = dev_id_valid;
+	link->serializer_dev_id = dev_id;
+	link->serializer_dev_rev_valid = dev_rev_valid;
+	link->serializer_dev_rev = dev_rev;
+	link->eeprom_present = eeprom_0x50 || eeprom_0x51;
+	link->eeprom_addr_7bit = eeprom_0x50 ? 0x50 :
+				 (eeprom_0x51 ? 0x51 : 0x00);
+
+	dev_info(priv->dev,
+		 "[DES-SCAN] link%u matched profile=%s module=%s rate=%uG serializer=%s EEPROM=0x%02x\n",
+		 link_id,
+		 profile->profile_name,
+		 profile->module_name,
+		 rate == CAM_GMSL2_RX_RATE_6GBPS ? 6 : 3,
+		 profile->serializer.name,
+		 link->eeprom_addr_7bit);
+
+	return 0;
+}
+
+static int max_des_apply_detected_link_rates(struct max_des_priv *priv)
+{
+	struct max_des *des = priv->des;
+	unsigned int link;
+	int ret;
+	int first_err = 0;
+
+	for (link = 0; link < des->ops->num_links; link++) {
+		enum cam_gmsl2_rx_rate rate;
+
+		if (des->links[link].cam)
+			rate = des->links[link].cam->serializer.forward_rate;
+		else
+			rate = CAM_GMSL2_RX_RATE_3GBPS;
+
+		ret = des->ops->set_link_rate(des, link, rate);
+		if (ret && !first_err)
+			first_err = ret;
+	}
+
+	msleep(MAX_DES_LINK_SETTLE_MS);
+	return first_err;
+}
+
+/*
+ * Scan sequence requested for mixed ISX031 / AR0820C modules:
+ *
+ *   1. Set all links to 3G (0x0010=0x11, 0x0011=0x11).
+ *   2. Select link0..3 individually (0x0006=0xf1/0xf2/0xf4/0xf8).
+ *   3. Probe serializer 0x40 and 0x41..0x44 plus EEPROM 0x50/0x51.
+ *   4. Set all links to 6G (0x0010=0x22, 0x0011=0x22).
+ *   5. Repeat the four-link probe.
+ *   6. Apply each detected camera profile's final per-link rate.
+ */
+static int max_des_scan_func(struct max_des_priv *priv)
+{
+	static const enum cam_gmsl2_rx_rate scan_rates[] = {
+		CAM_GMSL2_RX_RATE_3GBPS,
+		CAM_GMSL2_RX_RATE_6GBPS,
+	};
+	struct max_des *des;
+	unsigned int rate_idx;
+	unsigned int link;
+	u32 detected_mask = 0;
+	u32 restore_mask;
+	int ret;
+	int first_err = 0;
+
+	if (!priv || !priv->des || !priv->des->ops)
+		return -EINVAL;
+
+	des = priv->des;
+
+	if (!des->ops->select_links || !des->ops->set_link_rate)
+		return -EOPNOTSUPP;
+
+	dev_info(priv->dev,
+		 "[DES-SCAN] ===== camera profile scan start =====\n");
+
+	for (link = 0; link < des->ops->num_links; link++)
+		max_des_clear_link_scan_result(&des->links[link]);
+
+	for (rate_idx = 0; rate_idx < ARRAY_SIZE(scan_rates); rate_idx++) {
+		enum cam_gmsl2_rx_rate rate = scan_rates[rate_idx];
+
+		dev_info(priv->dev,
+			 "[DES-SCAN] pass%u: set all links to %uGbps\n",
+			 rate_idx,
+			 rate == CAM_GMSL2_RX_RATE_6GBPS ? 6 : 3);
+
+		ret = max_des_set_all_link_rates(priv, rate);
+		if (ret)
+			return ret;
+
+		for (link = 0; link < des->ops->num_links; link++) {
+			ret = max_des_scan_one_link(priv, link, rate);
+			if (ret == -ENODEV)
+				continue;
+
+			if (ret && ret != -EEXIST && !first_err)
+				first_err = ret;
+		}
+	}
+
+	for (link = 0; link < des->ops->num_links; link++) {
+		if (des->links[link].enabled && des->links[link].cam)
+			detected_mask |= BIT(link);
+	}
+
+	ret = max_des_apply_detected_link_rates(priv);
+	if (ret && !first_err)
+		first_err = ret;
+
+	restore_mask = detected_mask;
+	if (!restore_mask)
+		restore_mask = (1U << des->ops->num_links) - 1;
+
+	ret = des->ops->select_links(des, restore_mask);
+	if (ret && !first_err)
+		first_err = ret;
+
+	dev_info(priv->dev,
+		 "[DES-SCAN] scan complete: detected_mask=0x%x first_err=%d\n",
+		 detected_mask, first_err);
+
+	for (link = 0; link < des->ops->num_links; link++) {
+		const struct max_des_link *scan = &des->links[link];
+
+		dev_info(priv->dev,
+			 "[DES-SCAN] result link%u: enabled=%u profile=%s rate=%uG ser_addr=0x%02x id=%s0x%02x rev=%s0x%02x eeprom=0x%02x\n",
+			 link,
+			 scan->enabled,
+			 scan->cam ? scan->cam->profile_name : "none",
+			 scan->cam &&
+			 scan->cam->serializer.forward_rate ==
+				CAM_GMSL2_RX_RATE_6GBPS ? 6 : 3,
+			 scan->serializer_addr_7bit,
+			 scan->serializer_dev_id_valid ? "" : "invalid/",
+			 scan->serializer_dev_id,
+			 scan->serializer_dev_rev_valid ? "" : "invalid/",
+			 scan->serializer_dev_rev,
+			 scan->eeprom_addr_7bit);
+	}
+
+	dev_info(priv->dev,
+		 "[DES-SCAN] ===== camera profile scan end =====\n");
+
+	if (!detected_mask)
+		return first_err ? first_err : -ENODEV;
+
+	return first_err;
+}
+
 
 static int max_des_init_one_serializer(struct max_des_priv *priv,
 				       struct i2c_adapter *adap,
@@ -252,15 +604,20 @@ static int max_des_i2c_mux_init(struct max_des_priv *priv)
 	priv->mux->priv = priv;
 
 	for (i = 0; i < des->ops->num_links; i++) {
-		if (!des->links[i].enabled)
-			continue;
-
 		dev_info(priv->dev, "[DES-PROBE] 3a. Adding MUX adapter for Link %u...\n", i);
 		ret = i2c_mux_add_adapter(priv->mux, 0, i);
 		if (ret)
 			goto err_add_adapters;
 
 		if (!priv->mux->adapter[i])
+			continue;
+
+		/*
+		 * Add all physical link adapters so a later idle rescan can detect
+		 * a newly hot-plugged camera.  Only initialize serializers that were
+		 * matched by max_des_scan_func().
+		 */
+		if (!des->links[i].enabled || !des->links[i].cam)
 			continue;
 
 		/* 每條 link 切換後，照 vendor script 等待 */
@@ -361,13 +718,26 @@ static int max_des_rescan_links_idle(struct max_des_priv *priv)
 		goto out_unlock;
 	}
 
-	dev_info(priv->dev, "[DES-HOTPLUG] manual idle rescan start\n");
+	dev_info(priv->dev,
+		 "[DES-HOTPLUG] manual idle profile rescan start\n");
+
+	ret = max_des_scan_func(priv);
+	if (ret) {
+		dev_warn(priv->dev,
+			 "[DES-HOTPLUG] profile scan failed: %d\n", ret);
+		first_err = ret;
+	}
 
 	for (i = 0; i < des->ops->num_links; i++) {
+		if (!des->links[i].enabled || !des->links[i].cam)
+			continue;
+
 		if (!priv->mux->adapter[i]) {
 			dev_warn(priv->dev,
 				 "[DES-HOTPLUG] link%u has no mux adapter\n", i);
 			des->links[i].enabled = false;
+			if (!first_err)
+				first_err = -ENODEV;
 			continue;
 		}
 
@@ -386,15 +756,8 @@ static int max_des_rescan_links_idle(struct max_des_priv *priv)
 
 		msleep(MAX_DES_LINK_SETTLE_MS);
 
-		ret = max_des_init_one_serializer(priv, priv->mux->adapter[i], i);
-		if (ret == -ENODEV) {
-			dev_info(priv->dev,
-				 "[DES-HOTPLUG] link%u no serializer/camera detected\n",
-				 i);
-			des->links[i].enabled = false;
-			continue;
-		}
-
+		ret = max_des_init_one_serializer(priv,
+						  priv->mux->adapter[i], i);
 		if (ret) {
 			dev_warn(priv->dev,
 				 "[DES-HOTPLUG] link%u serializer init failed: %d\n",
@@ -405,27 +768,20 @@ static int max_des_rescan_links_idle(struct max_des_priv *priv)
 			continue;
 		}
 
-		des->links[i].enabled = true;
 		detected_mask |= BIT(i);
 
 		dev_info(priv->dev,
-			 "[DES-HOTPLUG] link%u serializer/camera detected\n",
-			 i);
+			 "[DES-HOTPLUG] link%u initialized as %s\n",
+			 i, des->links[i].cam->profile_name);
 	}
 
 	priv->detected_links_mask = detected_mask;
 
-	/*
-	 * Restore link selection after destructive per-link scanning.
-	 * If no links are detected, select all physical links so the DES is
-	 * not left at only the last scanned link.
-	 */
+	restore_mask = detected_mask;
+	if (!restore_mask)
+		restore_mask = (1U << des->ops->num_links) - 1;
+
 	if (des->ops->select_links) {
-		restore_mask = detected_mask;
-
-		if (!restore_mask)
-			restore_mask = (1U << des->ops->num_links) - 1;
-
 		ret = des->ops->select_links(des, restore_mask);
 		if (ret) {
 			dev_warn(priv->dev,
@@ -530,8 +886,8 @@ MODULE_PARM_DESC(hotplug_rescan,
 
 static void max_des_fill_default_fmt(struct v4l2_mbus_framefmt *fmt)
 {
-	fmt->width = 1920;
-	fmt->height = 1536;
+	fmt->width = 3840;
+	fmt->height = 2160;
 	fmt->code = MEDIA_BUS_FMT_UYVY8_1X16;
 	fmt->field = V4L2_FIELD_NONE;
 	fmt->colorspace = V4L2_COLORSPACE_SRGB;
@@ -646,7 +1002,7 @@ static int max_des_get_frame_desc(struct v4l2_subdev *sd, unsigned int pad,
 	for (i = 0; i < 4; i++) {
 		fd->entry[i].stream = i;
 		fd->entry[i].flags = V4L2_MBUS_FRAME_DESC_FL_LEN_MAX;
-		fd->entry[i].length = 1920 * 1536 * 2;
+		fd->entry[i].length = 1920 * 1536 * 2 * 2;
 		fd->entry[i].pixelcode = MEDIA_BUS_FMT_UYVY8_1X16;
 		fd->entry[i].bus.csi2.vc = i;
 		fd->entry[i].bus.csi2.dt = 0x1E;
@@ -1119,6 +1475,8 @@ int max_des_probe(struct i2c_client *client, struct max_des *des)
 	priv->dev = &client->dev;
 	priv->des = des;
 	des->priv = priv;
+	mutex_init(&priv->lock);
+	INIT_LIST_HEAD(&priv->hotplug_node);
 
 	dev_info(priv->dev, "\n============================================\n");
 	dev_info(priv->dev, "[DES-PROBE] 1. Allocating driver memory...\n");
@@ -1150,15 +1508,34 @@ int max_des_probe(struct i2c_client *client, struct max_des *des)
 
 	for (i = 0; i < des->ops->num_links; i++) {
 		des->links[i].index = i;
-		des->links[i].enabled = true;
+		des->links[i].enabled = false;
+		des->links[i].cam = NULL;
 	}
 
 	dev_info(priv->dev,
 		 "[DES-PROBE] 2. Invoking Hardware Init (GMSL Link Wakeup), TEST_LINK_ID=%u...\n",
 		 TEST_LINK_ID);
 
-	if (des->ops->init)
-		des->ops->init(des);
+	if (des->ops->init) {
+		ret = des->ops->init(des);
+		if (ret) {
+			dev_err(priv->dev,
+				"[DES-PROBE] des hardware init failed: %d\n",
+				ret);
+			return ret;
+		}
+	}
+
+	/*
+	 * Detect each camera profile before serializer re-addressing and before
+	 * V4L2 formats are created.
+	 */
+	ret = max_des_scan_func(priv);
+	if (ret) {
+		dev_err(priv->dev,
+			"[DES-PROBE] camera scan failed: %d\n", ret);
+		return ret;
+	}
 
 	ret = max_des_i2c_mux_init(priv);
 	if (ret)

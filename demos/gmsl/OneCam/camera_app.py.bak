@@ -9,7 +9,6 @@ import cv2
 # 1. 感測器設定檔 (Sensor Profiles)
 # ==========================================
 ov_gain = 2.2
-ar_gain = 1.8
 SENSOR_PROFILES = {
     "imx219": {
         "width": 3280,
@@ -53,8 +52,8 @@ SENSOR_PROFILES = {
         "pattern": "YUV422",
         "black_level": 0,
         "gamma": 1.0,
-        "gains": tuple(ar_gain * gain for gain in (1.10, 1.0, 0.85)),
-        "bit_depth": 8
+        "gains": (1.0, 1.0, 1.0),
+        "bit_depth": 8 
     }
 }
 
@@ -106,35 +105,17 @@ def main():
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--stride", type=int, default=0)
-    parser.add_argument(
-        "--software-isp",
-        choices=["off", "profile"],
-        default="off",
-        help=(
-            "YUV camera software correction mode. "
-            "'off' displays the ISP output directly; "
-            "'profile' applies the sensor profile after YUV-to-BGR conversion."
-        ),
-    )
     args = parser.parse_args()
 
     # 載入 Profile
     profile = SENSOR_PROFILES[args.sensor]
-    width = args.width if args.width is not None else profile["width"]
-    height = args.height if args.height is not None else profile["height"]
+    width = profile["width"]
+    height = profile["height"]
     pattern = profile["pattern"]
     r_gain, g_gain, b_gain = profile["gains"]
     gamma = profile["gamma"]
     black_level = profile["black_level"]
     bit_depth = profile["bit_depth"]
-
-    # 目前只允許 AR0820C 的 YUV 輸出選擇性套用軟體 Profile。
-    # RAW Bayer 相機仍維持原本一定會做軟體 ISP 的行為。
-    apply_yuv_profile = (
-        args.sensor == "ar0820c"
-        and pattern == "YUV422"
-        and args.software_isp == "profile"
-    )
 
     stride = args.stride if args.stride > 0 else get_stride(width)
     frame_bytes = stride * height * 2
@@ -143,11 +124,6 @@ def main():
     print(f"========== [Camera App: {args.sensor}] ==========", file=sys.stderr)
     print(f"Mode: Live | Res: {width}x{height} | Pattern: {pattern}", file=sys.stderr)
     print(f"Stride: {stride} | Scale: {resize_scale}", file=sys.stderr)
-    if pattern == "YUV422":
-        print(
-            f"Software ISP: {'PROFILE' if apply_yuv_profile else 'OFF (direct ISP output)'}",
-            file=sys.stderr,
-        )
 
     # 建立 LUT
     lut_r, lut_g, lut_b = create_luts(black_level, r_gain, g_gain, b_gain, gamma, bit_depth)
@@ -177,41 +153,19 @@ def main():
         current_frame = buf[:frame_bytes]
         buf = buf[frame_bytes:]
 
+
         if pattern == "YUV422":
-            yuv = np.frombuffer(
-                current_frame,
-                dtype=np.uint8
-            ).reshape(height, stride, 2)
-
+            # YUV422 (UYVY) 是 8-bit，每個像素對應 2 Bytes。
+            # OpenCV 轉換 UYVY 需要 (height, width, 2) 的 3D 陣列結構
+            yuv = np.frombuffer(current_frame, dtype=np.uint8).reshape(height, stride, 2)
+            # 裁切掉 padding 的部分 (只取實際寬度)
             yuv = yuv[:, :width, :]
-
             # UYVY 轉 BGR
-            disp = cv2.cvtColor(
-                yuv,
-                cv2.COLOR_YUV2BGR_UYVY
-            )
-
-            # 先縮放，減少後續軟體校正的運算量
+            disp = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_UYVY)
+            
+            # 縮放處理
             if resize_scale != 1.0:
-                disp = cv2.resize(
-                    disp,
-                    (0, 0),
-                    fx=resize_scale,
-                    fy=resize_scale,
-                    interpolation=cv2.INTER_NEAREST,
-                )
-
-            # 只有 AR0820C 且傳入 profile 時才校正
-            if apply_yuv_profile:
-                out_b = lut_b[disp[:, :, 0]]
-                out_g = lut_g[disp[:, :, 1]]
-                out_r = lut_r[disp[:, :, 2]]
-
-                disp = np.dstack((
-                    out_b,
-                    out_g,
-                    out_r,
-                ))
+                disp = cv2.resize(disp, (0, 0), fx=resize_scale, fy=resize_scale, interpolation=cv2.INTER_NEAREST)
                 
         else:
             # === 原本的 RAW Bayer 處理邏輯 ===

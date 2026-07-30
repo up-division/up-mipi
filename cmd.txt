@@ -1,6 +1,4 @@
-cd ~/Work/gmsl/upmipi/ipu6/drivers/media/i2c/gmsl
-
-cd ~/Work/gmsl/upmipi/ipu6/drivers/media/i2c/gmsl_hotplug
+cd ~/Work/gmsl/upmipi/ipu6/drivers/media/i2c/gmsl_AutoDetectDiffcam
 
 sudo rmmod max96724_driver max_gmsl_lib
 sudo rm -rf *.o *.ko *.mod.c *.mod.o *.mod *.symvers *.order
@@ -10,13 +8,11 @@ sudo cp max96724_driver.ko /lib/modules/$(uname -r)/updates/drivers/media/i2c/gm
 sudo depmod -a
 sudo rm -rf *.o *.ko *.mod.c *.mod.o *.mod *.symvers *.order
 sudo modprobe max96724_driver
-
 ------------------------------------------------------------------------------------------------------
 sudo rmmod max96724_driver max_gmsl_lib
 sudo modprobe max96724_driver
 echo 'i2c-MAX96724:00' | sudo tee /sys/bus/i2c/drivers/max96724/bind
 echo 'i2c-MAX96724:00' | sudo tee /sys/bus/i2c/drivers/max96724/unbind
-echo 1 | sudo tee /sys/module/max_gmsl_lib/parameters/hotplug_rescan
 ------------------------------------------------------------------------------------------------------
 sudo dmesg -w | grep -E "isx|max9|ipu|i2c|imx"
 sudo dmesg | grep -E "isx|max9|ipu|i2c" | wl-copy 
@@ -45,17 +41,19 @@ gst-launch-1.0 -v \
 
 ffmpeg -f rawvideo -pixel_format uyvy422 -video_size 1920x1536 -i cam32.raw -f image2 output_%03d.png
 ------------------------------------------------------------------------------------------------------
-sudo i2ctransfer -y -f 5 w3@0x27 0x09 0x03 0x00
-sudo i2ctransfer -y -f 5 w2@0x27 0x09 0x03 r1
-sudo i2ctransfer -y -f 5 w3@0x43 0x02 0xbe 0x10
-sudo i2ctransfer -y -f 5 w2@0x43 0x02 0xbe r1
+sudo i2ctransfer -y -f 5 w3@0x27 0x00 0x10 0x11
+sudo i2ctransfer -y -f 5 w2@0x27 0x00 0x10 r1
+sudo i2ctransfer -y -f 0 w3@0x27 0x00 0x11 0x11
+sudo i2ctransfer -y -f 0 w2@0x27 0x00 0x11 r1
+sudo i2ctransfer -y -f 0 w3@0x41 0x02 0xbe 0x10
+sudo i2ctransfer -y -f 0 w2@0x41 0x02 0xbe r1
 ------------------------------------------------------------------------------------------------------
-sudo gpioset -m wait gpiochip0 397=0
+sudo gpioset -m wait gpiochip0 113=0
 
 echo "options intel_ipu6 isys_freq_override=400" | sudo tee /etc/modprobe.d/ipu.conf
 echo -1 | sudo tee /sys/module/intel_ipu6_isys/parameters/dwc_mbps_override
 echo -1 | sudo tee /sys/module/intel_ipu6_isys/parameters/dwc_hsfreq_index_override
 echo -1 | sudo tee /sys/module/intel_ipu6_isys/parameters/dwc_osc_freq_target_override
 echo -1 | sudo tee /sys/module/intel_ipu6_isys/parameters/dwc_deskew_polarity_rw_override
-
-cat /sys/module/intel_ipu6_isys/parameters/dwc_osc_freq_target_override
+echo 1 | sudo tee /sys/module/max_gmsl_lib/parameters/hotplug_rescan
+echo "4 2 3840 2160" | sudo tee /sys/module/intel_ipu6_isys/parameters/csi2_runtime_format

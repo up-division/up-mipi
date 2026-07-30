@@ -180,18 +180,77 @@ static int max96724_link_enable(struct max96724_priv *priv, u16 val)
 	return 0;
 }
 
+static int max96724_set_link_rate_field(struct max96724_priv *priv,
+					 unsigned int link_id,
+					 enum cam_gmsl2_rx_rate rate)
+{
+	u16 reg;
+	u8 shift;
+	u8 mask;
+	u8 val;
+
+	if (link_id >= MAX96724_MULTI_LINKS)
+		return -EINVAL;
+
+	if (rate != CAM_GMSL2_RX_RATE_3GBPS &&
+	    rate != CAM_GMSL2_RX_RATE_6GBPS)
+		return -EINVAL;
+
+	/*
+	 * 0x0010:
+	 *   Link A RX rate [1:0], Link B RX rate [5:4]
+	 * 0x0011:
+	 *   Link C RX rate [1:0], Link D RX rate [5:4]
+	 */
+	reg = (link_id < 2) ? 0x0010 : 0x0011;
+	shift = (link_id & 0x1) ? 4 : 0;
+	mask = 0x3 << shift;
+	val = ((u8)rate & 0x3) << shift;
+
+	return max96724_update_bits(priv, reg, mask, val);
+}
+
+static int max96724_des_set_link_rate(struct max_des *des,
+				      unsigned int link_id,
+				      enum cam_gmsl2_rx_rate rate)
+{
+	struct max96724_priv *priv = des_to_priv(des);
+	int ret;
+
+	ret = max96724_set_link_rate_field(priv, link_id, rate);
+	if (ret)
+		return ret;
+
+	/* Apply the new receive rate to this link. */
+	ret = max96724_write(priv, 0x0018, BIT(link_id));
+	if (ret)
+		return ret;
+
+	msleep(20);
+
+	dev_info(priv->dev,
+		 "[DES-SCAN] link%u RX rate set to %uGbps\n",
+		 link_id,
+		 rate == CAM_GMSL2_RX_RATE_6GBPS ? 6 : 3);
+
+	return 0;
+}
+
 static int max96724_link_rate(struct max96724_priv *priv)
 {
-	int ret = 0;
+	unsigned int link;
+	int ret;
 
-	/* Link A-D 3Gbps forward / 187.5Mbps reverse */
-	ret = max96724_write(priv, 0x0010, 0x11);
-	if (ret)
-		return ret;
-
-	ret = max96724_write(priv, 0x0011, 0x11);
-	if (ret)
-		return ret;
+	/*
+	 * Temporary bring-up default.  max_des_scan_func() will subsequently
+	 * test 3Gbps and 6Gbps and apply each detected camera profile's rate.
+	 */
+	for (link = 0; link < MAX96724_MULTI_LINKS; link++) {
+		ret = max96724_set_link_rate_field(priv, link,
+						  CAM_GMSL2_RX_RATE_6GBPS);
+		if (ret)
+			return ret;
+	}
 
 	return 0;
 }
@@ -1360,6 +1419,7 @@ static const struct max_des_ops max96724_ops = {
 
 	.init = max96724_des_init,
 	.select_links = max96724_des_select_links,
+	.set_link_rate = max96724_des_set_link_rate,
 
 	.log_status = max96724_des_log_status,
 	.log_reg_status = max96724_reg_dump_ops,
