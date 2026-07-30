@@ -11,6 +11,8 @@
 #include <linux/err.h>
 #include <linux/io.h>
 #include <linux/minmax.h>
+#include <linux/moduleparam.h>
+#include <linux/mutex.h>
 #include <linux/sprintf.h>
 
 #include <media/media-entity.h>
@@ -49,8 +51,195 @@ static const u32 csi2_supported_codes[] = {
 	MEDIA_BUS_FMT_META_12,
 	MEDIA_BUS_FMT_META_16,
 	MEDIA_BUS_FMT_META_24,
+
 	0
 };
+
+/*
+ * Runtime format override
+ *
+ * Write format:
+ *   echo "<port> <stream> <width> <height>" >
+ *        /sys/module/<ipu6-isys-module>/parameters/csi2_runtime_format
+ *
+ * Example:
+ *   echo "4 1 3840 2160" > .../csi2_runtime_format
+ *
+ * This updates the CSI2 subdev active state directly. The pipeline must not
+ * be streaming while the format is changed.
+ */
+#define IPU6_CSI2_RUNTIME_MAX_PORTS	8
+#define IPU6_CSI2_RUNTIME_STREAMS	4
+#define IPU6_CSI2_RUNTIME_MAX_SIZE	16384
+
+static DEFINE_MUTEX(ipu6_csi2_registry_mutex);
+static struct ipu6_isys_csi2
+	*ipu6_csi2_registry[IPU6_CSI2_RUNTIME_MAX_PORTS];
+
+static int ipu6_csi2_runtime_format_set(const char *val,
+					const struct kernel_param *kp)
+{
+	struct ipu6_isys_csi2 *csi2;
+	struct v4l2_subdev *sd;
+	struct v4l2_subdev_state *state;
+	struct v4l2_mbus_framefmt *sink_fmt;
+	struct v4l2_mbus_framefmt *source_fmt;
+	struct v4l2_rect *crop;
+	unsigned int port;
+	unsigned int stream;
+	unsigned int width;
+	unsigned int height;
+	unsigned int source_pad;
+	int parsed;
+	int ret = 0;
+
+	parsed = sscanf(val, "%u %u %u %u",
+			&port, &stream, &width, &height);
+	if (parsed != 4)
+		parsed = sscanf(val, "%u,%u,%u,%u",
+				&port, &stream, &width, &height);
+	if (parsed != 4)
+		return -EINVAL;
+
+	if (port >= IPU6_CSI2_RUNTIME_MAX_PORTS ||
+	    stream >= IPU6_CSI2_RUNTIME_STREAMS ||
+	    !width || !height ||
+	    width > IPU6_CSI2_RUNTIME_MAX_SIZE ||
+	    height > IPU6_CSI2_RUNTIME_MAX_SIZE ||
+	    (width & 1))
+		return -EINVAL;
+
+	mutex_lock(&ipu6_csi2_registry_mutex);
+
+	csi2 = ipu6_csi2_registry[port];
+	if (!csi2 || !csi2->isys) {
+		ret = -ENODEV;
+		goto out_registry;
+	}
+
+	sd = &csi2->asd.sd;
+	state = v4l2_subdev_lock_and_get_active_state(sd);
+	if (!state) {
+		ret = -ENODEV;
+		goto out_registry;
+	}
+
+	/*
+	 * Keep the same lock order as the stream operations:
+	 * active-state lock first, stream mutex second.
+	 */
+	mutex_lock(&ipu6_csi2_stream_mutex);
+
+	if (csi2->enabled_sink_streams & BIT_ULL(stream)) {
+	dev_warn(&csi2->isys->adev->auxdev.dev,
+		 "[IPU-CFG] reject runtime format: CSI2-%u stream%u "
+		 "is active, enabled=0x%llx\n",
+		 port, stream,
+		 (unsigned long long)csi2->enabled_sink_streams);
+
+	ret = -EBUSY;
+	goto out_stream;
+}
+
+	source_pad = stream + 1;
+
+	sink_fmt = v4l2_subdev_state_get_format(state, CSI2_PAD_SINK,
+						 stream);
+	source_fmt = v4l2_subdev_state_get_format(state, source_pad, stream);
+	if (!sink_fmt || !source_fmt) {
+		ret = -EINVAL;
+		goto out_stream;
+	}
+
+	sink_fmt->width = width;
+	sink_fmt->height = height;
+	sink_fmt->code = MEDIA_BUS_FMT_UYVY8_1X16;
+	sink_fmt->field = V4L2_FIELD_NONE;
+
+	*source_fmt = *sink_fmt;
+
+	/* Keep the source crop consistent with the new full-frame format. */
+	crop = v4l2_subdev_state_get_crop(state, source_pad, stream);
+	if (crop) {
+		crop->left = 0;
+		crop->top = 0;
+		crop->width = width;
+		crop->height = height;
+	}
+
+	dev_info(&csi2->isys->adev->auxdev.dev,
+		 "[IPU-CFG] runtime format: CSI2-%u stream%u "
+		 "sink=%u/%u source=%u/%u %ux%u UYVY\n",
+		 port, stream, CSI2_PAD_SINK, stream,
+		 source_pad, stream, width, height);
+
+out_stream:
+	mutex_unlock(&ipu6_csi2_stream_mutex);
+	v4l2_subdev_unlock_state(state);
+out_registry:
+	mutex_unlock(&ipu6_csi2_registry_mutex);
+
+	return ret;
+}
+
+static int ipu6_csi2_runtime_format_get(char *buf,
+					const struct kernel_param *kp)
+{
+	struct ipu6_isys_csi2 *csi2;
+	struct v4l2_subdev_state *state;
+	struct v4l2_mbus_framefmt *fmt;
+	unsigned int port;
+	unsigned int stream;
+	int len = 0;
+
+	mutex_lock(&ipu6_csi2_registry_mutex);
+
+	for (port = 0; port < IPU6_CSI2_RUNTIME_MAX_PORTS; port++) {
+		csi2 = ipu6_csi2_registry[port];
+		if (!csi2 || !csi2->isys)
+			continue;
+
+		state = v4l2_subdev_lock_and_get_active_state(&csi2->asd.sd);
+		if (!state)
+			continue;
+
+		for (stream = 0; stream < IPU6_CSI2_RUNTIME_STREAMS; stream++) {
+			fmt = v4l2_subdev_state_get_format(state,
+							 CSI2_PAD_SINK,
+							 stream);
+			if (!fmt)
+				continue;
+
+			len += scnprintf(buf + len, PAGE_SIZE - len,
+					 "port=%u stream=%u %ux%u code=0x%x\n",
+					 port, stream, fmt->width, fmt->height,
+					 fmt->code);
+			if (len >= PAGE_SIZE - 1)
+				break;
+		}
+
+		v4l2_subdev_unlock_state(state);
+		if (len >= PAGE_SIZE - 1)
+			break;
+	}
+
+	mutex_unlock(&ipu6_csi2_registry_mutex);
+
+	if (!len)
+		len = scnprintf(buf, PAGE_SIZE, "no CSI2 port registered\n");
+
+	return len;
+}
+
+static const struct kernel_param_ops ipu6_csi2_runtime_format_ops = {
+	.set = ipu6_csi2_runtime_format_set,
+	.get = ipu6_csi2_runtime_format_get,
+};
+
+module_param_cb(csi2_runtime_format,
+		&ipu6_csi2_runtime_format_ops, NULL, 0644);
+MODULE_PARM_DESC(csi2_runtime_format,
+	"Runtime CSI2 format: '<port> <stream> <width> <height>'");
 
 /*
  * Strings corresponding to CSI-2 receiver errors are here.
@@ -758,6 +947,12 @@ static const struct media_entity_operations csi2_entity_ops = {
 
 void ipu6_isys_csi2_cleanup(struct ipu6_isys_csi2 *csi2)
 {
+	mutex_lock(&ipu6_csi2_registry_mutex);
+	if (csi2->port < IPU6_CSI2_RUNTIME_MAX_PORTS &&
+	    ipu6_csi2_registry[csi2->port] == csi2)
+		ipu6_csi2_registry[csi2->port] = NULL;
+	mutex_unlock(&ipu6_csi2_registry_mutex);
+
 	if (!csi2->isys)
 		return;
 
@@ -802,6 +997,20 @@ int ipu6_isys_csi2_init(struct ipu6_isys_csi2 *csi2,
 	if (ret) {
 		dev_err(dev, "failed to register v4l2 subdev\n");
 		goto fail;
+	}
+
+	if (index < IPU6_CSI2_RUNTIME_MAX_PORTS) {
+		mutex_lock(&ipu6_csi2_registry_mutex);
+		ipu6_csi2_registry[index] = csi2;
+		mutex_unlock(&ipu6_csi2_registry_mutex);
+
+		dev_info(dev,
+			 "[IPU-CFG] CSI2-%u registered for runtime format control\n",
+			 index);
+	} else {
+		dev_warn(dev,
+			 "[IPU-CFG] CSI2-%u exceeds runtime registry limit %u\n",
+			 index, IPU6_CSI2_RUNTIME_MAX_PORTS);
 	}
 
 	return 0;
